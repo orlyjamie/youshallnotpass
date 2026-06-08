@@ -1,0 +1,8 @@
+name: youshallnotpass
+version: 1.0.0
+description: "A pre_tool_call policy gate. Forces human approval on outbound / state-changing actions (social writes, GitHub writes, force-push, etc.) and hard-denies dedicated outbound tools — turning a successful prompt-injection into a visible, vetoable approval (CLI prompt or Telegram ✅/❌ buttons). General-purpose: the same hook can enforce egress allowlists, path guards, rate limits, and DLP."
+author: theonejvo (Jamieson O'Reilly)
+license: MIT
+kind: standalone
+provides_hooks:
+  - pre_tool_call
