@@ -182,17 +182,37 @@ def _summarize(args) -> str:
     return s[:200]
 
 
-def _require_approval(summary: str) -> bool:
-    """Block until the operator approves (Telegram buttons / CLI prompt). FAIL CLOSED."""
+def _require_approval(summary: str, pattern_key: str = "youshallnotpass") -> bool:
+    """Block until the operator approves (Telegram buttons / CLI prompt). FAIL CLOSED.
+
+    Honours the chosen SCOPE so "Session"/"Always" actually stick (keyed per tool):
+      "Session" -> approve_session(); "Always" -> approve_permanent() (persisted).
+    Short-circuits if `pattern_key` is already session/permanently approved."""
     try:
         session_key = approval.get_current_session_key()
+        try:
+            if approval.is_approved(session_key, pattern_key):
+                return True
+        except Exception:
+            pass
         notify_cb = getattr(approval, "_gateway_notify_cbs", {}).get(session_key)
-        data = {"command": summary, "description": summary, "pattern_key": "youshallnotpass"}
+        data = {"command": summary, "description": summary, "pattern_key": pattern_key}
         if notify_cb is not None:
             res = approval._await_gateway_decision(session_key, notify_cb, data) or {}
             choice = res.get("choice")
         else:
             choice = approval.prompt_dangerous_approval(summary, summary)
+        try:
+            if choice == "session":
+                approval.approve_session(session_key, pattern_key)
+            elif choice == "always":
+                approval.approve_permanent(pattern_key)
+                try:
+                    approval.save_permanent_allowlist(approval._permanent_approved)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return choice in ("once", "session", "always", "approve", "yes", "y")
     except Exception as e:
         logger.warning("youshallnotpass: approval unavailable (%s) — denying", e)
@@ -212,7 +232,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
         return {"action": "block",
                 "message": f"youshallnotpass: '{tool_name}' is denied by policy on '{platform}'."}
     if action == "approve":
-        if not _require_approval(f"{tool_name} {_summarize(args)}"):
+        if not _require_approval(f"{tool_name} {_summarize(args)}", pattern_key=f"ynp:{tool_name}"):
             return {"action": "block",
                     "message": f"youshallnotpass: '{tool_name}' was not approved by the operator."}
     return None  # allow
