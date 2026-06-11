@@ -13,7 +13,8 @@ Skills run as `terminal` commands (not distinct tools), so they're gated surgica
 via `command_patterns` — these are registered with Hermes' native dangerous-command
 gate so a matching shell command triggers the same approval UI.
 
-CONFIG: edit  $HERMES_HOME/youshallnotpass.json  (re-read live on change). Example:
+CONFIG: edit  $HERMES_HOME/youshallnotpass.json  (re-read live on change; newly
+added command_patterns register live too, but REMOVING one needs a restart). Example:
   {
     "default": "allow",
     "rules":      { "mail_send": "approve", "web_fetch": "allow", "bash": "approve" },
@@ -106,9 +107,26 @@ _ACTION_ALIASES = {"ask": "approve"}
 _VALID_ACTIONS = ("allow", "approve", "deny")
 
 
-def _norm_action(a: str) -> str:
-    a = (a or "").lower()
+def _norm_action(a) -> str:
+    a = (a if isinstance(a, str) else "").lower().strip()
     return _ACTION_ALIASES.get(a, a)
+
+
+_warned_actions = set()
+
+
+def _effective_action(tool_name: str, platform: str, policy: dict) -> str:
+    """Resolve + normalize the action for (tool, platform). Anything that isn't a
+    valid action after normalization (hand-edited config typo like "denied", a
+    non-string value, …) becomes "approve" — the gate fails CLOSED, never open."""
+    action = _norm_action(_resolve_action(tool_name, platform, policy))
+    if action not in _VALID_ACTIONS:
+        if action not in _warned_actions:
+            _warned_actions.add(action)
+            logger.warning("youshallnotpass: unknown action %r (tool %r) — treating as 'approve'",
+                           action, tool_name)
+        return "approve"
+    return action
 
 
 _STATE_GLYPH = {"allow": "🟢 allow", "approve": "🟡 ask", "deny": "🔴 deny"}
@@ -147,6 +165,9 @@ def _policy() -> dict:
             logger.warning("youshallnotpass: bad config %s (%s) — using defaults", path, e)
     _policy_cache["mtime"] = mtime
     _policy_cache["data"] = data
+    # Pick up command_patterns added since startup (dedup'd). Removing a pattern
+    # still requires a restart — the native gate has no unregister.
+    _register_command_patterns(data)
     return data
 
 
@@ -226,7 +247,7 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
     if policy.get("enabled") is False:   # disarmed via /ynp off
         return None
     platform = _current_platform()
-    action = _resolve_action(tool_name, platform, policy)
+    action = _effective_action(tool_name, platform, policy)
 
     if action == "deny":
         return {"action": "block",
@@ -238,13 +259,19 @@ def _pre_tool_call(tool_name=None, args=None, **kwargs):
     return None  # allow
 
 
+_registered_patterns = set()
+
+
 def _register_command_patterns(policy: dict) -> None:
     """Register terminal/skill command patterns with the native dangerous-command gate
-    so matching shell commands trigger the same approval UI."""
+    so matching shell commands trigger the same approval UI. Called at startup AND on
+    every policy reload; `_registered_patterns` keeps re-registration idempotent."""
     for entry in policy.get("command_patterns") or []:
         try:
             pattern, desc = entry[0], entry[1]
         except (IndexError, TypeError):
+            continue
+        if pattern in _registered_patterns:
             continue
         try:
             if hasattr(approval, "register_dangerous_pattern"):
@@ -252,6 +279,7 @@ def _register_command_patterns(policy: dict) -> None:
             else:
                 approval.DANGEROUS_PATTERNS.append((pattern, desc))
                 approval.DANGEROUS_PATTERNS_COMPILED.append((re.compile(pattern, approval._RE_FLAGS), desc))
+            _registered_patterns.add(pattern)
         except Exception as e:
             logger.warning("youshallnotpass: could not register pattern %r (%s)", pattern, e)
 
@@ -387,7 +415,7 @@ def _catalog_view() -> str:
     for toolset in sorted(by_toolset):
         lines.append(f"  {toolset}")
         for tool in sorted(by_toolset[toolset]):
-            action = _norm_action(_resolve_action(tool, platform, p))
+            action = _effective_action(tool, platform, p)
             state = _STATE_GLYPH.get(action, action)
             row = f"    {tool.ljust(width)}  {state}"
             if tool in _SELF_GATED:
@@ -452,10 +480,35 @@ def _slash_ynp(raw_args: str):
         raw.setdefault("rules", {})[tool] = action
         scope = "everywhere"
     _save_raw(raw)
-    return f"✅ {tool} → {action} {scope}"
+    note = ""
+    try:
+        from tools.registry import registry
+        if tool not in (registry.get_tool_to_toolset_map() or {}):
+            note = f"\n⚠️ '{tool}' isn't in the live tool registry — check the spelling with /ynp list."
+    except Exception:
+        pass   # registry unavailable (e.g. plugins still loading) — rule saved either way
+    return f"✅ {tool} → {action} {scope}{note}"
+
+
+_APPROVAL_CONTRACT = (
+    "get_current_session_key", "is_approved", "_gateway_notify_cbs",
+    "_await_gateway_decision", "prompt_dangerous_approval",
+    "approve_session", "approve_permanent",
+)
+
+
+def _check_approval_contract(plugin: str) -> None:
+    """The approval flow leans on private tools.approval members. If a Hermes
+    upgrade renames them, every 'approve' resolves to deny (safe but confusing) —
+    say so loudly at startup instead of letting the operator discover it mid-task."""
+    missing = [n for n in _APPROVAL_CONTRACT if not hasattr(approval, n)]
+    if missing:
+        logger.warning("%s: tools.approval is missing %s — 'approve' actions will "
+                       "fail closed (deny) until this plugin is updated", plugin, missing)
 
 
 def register(ctx) -> None:
+    _check_approval_contract("youshallnotpass")
     _register_command_patterns(_policy())               # surgical terminal/skill gating
     ctx.register_hook("pre_tool_call", _pre_tool_call)   # per-tool / per-platform gate
     ctx.register_hook("pre_gateway_dispatch", _capture_platform)  # learn the platform for /ynp
